@@ -1,12 +1,30 @@
-import customtkinter as ctk
-import threading
+# -*- coding: utf-8 -*-
+import os
+import csv
 import numpy as np
 import torch
-import os
+import requests
+from datetime import datetime
+from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-# --- 1. MODEL & KNOWLEDGE BASE SETUP ---
+# Terminal UI
+from rich.console import Console
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.live import Live
+from rich.text import Text
+from rich.prompt import Prompt
+from rich.table import Table
+
+# Setup
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+console = Console()
+
+# -----------------------------
+# 1) Medical Knowledge Base
+# -----------------------------
 knowledge_base = [
     "Important Notice: This medical chatbot assistant is intended for informational and educational purposes only. It is not a substitute for evaluation by a licensed healthcare professional. ",
     "If you are experiencing severe symptoms, your symptoms are getting worse, or you think you may have a medical emergency, seek immediate medical attention or call your local emergency number right away. ",
@@ -46,116 +64,175 @@ knowledge_base = [
     "Depression is a mood disorder that causes a persistent feeling of sadness and loss of interest "
 ]
 
-DISCLAIMER = "\n\n(Note: Seek professional help.)"
-CONF_THRESHOLD = 0.22
+# -----------------------------
+# 2) HARDENED CSV Logging
+# -----------------------------
+# We use an absolute path to ensure the file is created in the script's directory
+CSV_PATH = os.path.join(os.getcwd(), "web_scrape_log.csv")
 
-# Load Models
-print("Loading AI Models... please wait.")
+def log_to_csv(query, source, content):
+    """Logs the exact data retrieved to a CSV file for testing purposes."""
+    fieldnames = ["Timestamp", "User_Query", "Source", "Retrieved_Content"]
+    file_exists = os.path.isfile(CSV_PATH)
+    
+    try:
+        with open(CSV_PATH, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow({
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "User_Query": query,
+                "Source": source,
+                "Retrieved_Content": str(content).replace('\n', ' ')
+            })
+    except Exception as e:
+        # Fallback print if file writing fails
+        print(f"DEBUG: CSV Log Error: {e}")
+
+# -----------------------------
+# 3) FIXED Web Scraper (NIH Search Engine)
+# -----------------------------
+def scrape_medical_info(query):
+    """
+    Scrapes the NIH/MedlinePlus Vivisimo search engine specifically.
+    """
+    # The specific URL provided by the user
+    base_url = "https://vsearch.nlm.nih.gov/vivisimo/cgi-bin/query-meta"
+    params = {
+        "v:project": "medlineplus",
+        "v:sources": "medlineplus-bundle",
+        "query": query
+    }
+    
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(base_url, params=params, headers=headers, timeout=15)
+        
+        if response.status_code != 200:
+            log_to_csv(query, f"HTTP FAIL {response.status_code}", "No connection")
+            return None
+            
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # In the Vivisimo engine, search results are often in spans with class 'snippet'
+        # or divs with class 'document-snippet'
+        snippets = soup.find_all(['span', 'div'], class_=['snippet', 'document-snippet', 'description'])
+        
+        if not snippets:
+            # Fallback: find any text within the results-list container
+            results_container = soup.find(id='results-list')
+            if results_container:
+                snippets = results_container.find_all('p')
+
+        if snippets:
+            # Combine the first 3 snippets found
+            extracted_text = " ".join([s.get_text(strip=True) for s in snippets[:3]])
+            if len(extracted_text) > 10:
+                log_to_csv(query, "SUCCESS (MedlinePlus)", extracted_text)
+                return extracted_text
+            
+        log_to_csv(query, "FAILED (No Content Found)", "The page loaded but no snippets were detected.")
+        return None
+        
+    except Exception as e:
+        log_to_csv(query, f"CRITICAL ERROR: {str(e)}", "N/A")
+        return None
+
+# -----------------------------
+# 4) AI Model Setup
+# -----------------------------
+console.print("[bold cyan]🤖 Initializing AI Models and Knowledge Base...[/bold cyan]")
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
-kb_vectors = embedder.encode(knowledge_base, convert_to_numpy=True)
-kb_vectors = kb_vectors / (np.linalg.norm(kb_vectors, axis=1, keepdims=True) + 1e-12)
-
 MODEL_NAME = "google/flan-t5-base"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
-# --- 2. UI IMPLEMENTATION ---
+kb_vectors = embedder.encode(knowledge_base)
+kb_vectors = kb_vectors / np.linalg.norm(kb_vectors, axis=1, keepdims=True)
 
-class MedicalChatbotApp(ctk.CTk):
-    def __init__(self):
-        super().__init__()
+# -----------------------------
+# 5) UI Layout and Main Logic
+# -----------------------------
+DISCLAIMER = "Educational purposes only. Seek professional medical help for emergencies."
 
-        # Window Config
-        self.title("Medical Info AI Assistant")
-        self.geometry("900x700")
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
+def get_layout():
+    l = Layout()
+    l.split(Layout(name="header", size=3), Layout(name="body"), Layout(name="footer", size=3))
+    l["body"].split_row(Layout(name="side", ratio=1), Layout(name="main", ratio=3))
+    return l
 
-        # Layout Grid
-        self.grid_rowconfigure(0, weight=1)  
-        self.grid_columnconfigure(1, weight=1)
+layout = get_layout()
+layout["header"].update(Panel("🏥 MEDICAL INFORMATION ASSISTANT", style="bold white on blue"))
+layout["side"].update(Panel("Local Topics:\n• Fever\n• Chronic Pain\n• Heart\n• Bronchitis", title="System Knowledge", border_style="blue"))
+layout["footer"].update(Panel(f"Test Log: {CSV_PATH} | Type 'exit' to quit", style="italic grey50"))
 
-        # --- Sidebar ---
-        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
-        self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
-        
-        self.sidebar_label = ctk.CTkLabel(self.sidebar, text="Medical AI", font=ctk.CTkFont(size=20, weight="bold"))
-        self.sidebar_label.grid(row=0, column=0, padx=20, pady=20)
-        
-        self.info_label = ctk.CTkLabel(self.sidebar, text="This tool provides info\nbased on a medical DB.\n\nNot for diagnosis.", 
-                                      wraplength=160, font=ctk.CTkFont(size=12))
-        self.info_label.grid(row=1, column=0, padx=20, pady=10)
+history = []
 
-        # --- Chat Display Area (The "ChatGPT" Box) ---
-        self.chat_display = ctk.CTkTextbox(self, state="disabled", wrap="word", font=("Arial", 14))
-        self.chat_display.grid(row=0, column=1, padx=20, pady=(20, 0), sticky="nsew")
+# Start session with explicit disclaimer
+console.clear()
+console.print(Panel(f"[bold red]MEDICAL DISCLAIMER[/bold red]\n{DISCLAIMER}", border_style="red"))
 
-        # --- Input Frame ---
-        self.input_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.input_frame.grid(row=1, column=1, padx=20, pady=20, sticky="ew")
-        self.input_frame.grid_columnconfigure(0, weight=1)
+while True:
+    chat_render = Text()
+    for q, r in history[-2:]:
+        chat_render.append(f"User: {q}\n", style="bold yellow")
+        chat_render.append(Text.from_markup(f"{r}\n\n"))
+    
+    layout["main"].update(Panel(chat_render, title="Chat History", border_style="green"))
 
-        self.user_entry = ctk.CTkEntry(self.input_frame, placeholder_text="Ask about symptoms (e.g. fever, bronchitis)...", height=40)
-        self.user_entry.grid(row=0, column=0, padx=(0, 10), sticky="ew")
-        self.user_entry.bind("<Return>", lambda event: self.send_message()) 
+    with Live(layout, refresh_per_second=2, screen=False):
+        pass
+    
+    user_input = Prompt.ask("\n[bold white]Question[/bold white]")
+    if user_input.lower() in ['exit', 'quit']: 
+        break
 
-        self.send_button = ctk.CTkButton(self.input_frame, text="Send", width=100, height=40, command=self.send_message)
-        self.send_button.grid(row=0, column=1)
+    # 1. Similarity Logic
+    q_vec = embedder.encode([user_input])
+    q_vec = q_vec / np.linalg.norm(q_vec)
+    scores = (q_vec @ kb_vectors.T).flatten()
+    top_score = scores[np.argmax(scores)]
+    
+    context = ""
+    source = ""
 
-        # Initial Greeting
-        self.append_chat("Bot", "Hello! I am your medical information assistant. How can I help you today?")
-
-    def append_chat(self, sender, message):
-        self.chat_display.configure(state="normal")
-        self.chat_display.insert("end", f"{sender}: {message}\n\n")
-        self.chat_display.configure(state="disabled")
-        self.chat_display.see("end")
-
-    def send_message(self):
-        user_text = self.user_entry.get().strip()
-        if not user_text:
-            return
-
-        self.append_chat("You", user_text)
-        self.user_entry.delete(0, "end")
-        
-        # Run AI logic in a separate thread to keep UI smooth
-        thread = threading.Thread(target=self.generate_bot_response, args=(user_text,))
-        thread.daemon = True
-        thread.start()
-
-    def generate_bot_response(self, question):
-        q_clean = question.lower()
-
-        # Logic for greetings and small talk
-        if q_clean in ["hi", "hello", "hey", "hi there"]:
-            response = "Hello! What symptoms or medical topics are you curious about today?"
-        elif len(set(q_clean)) < 4:
-            response = "I'm sorry, I didn't quite understand that. Please ask a health-related question."
-        else:
-            # Vector Search / Agentic Retrieval
-            q_vec = embedder.encode([question], convert_to_numpy=True)
-            q_vec = q_vec / (np.linalg.norm(q_vec, axis=1, keepdims=True) + 1e-12)
-            scores = (q_vec @ kb_vectors.T).flatten()
-            
-            top_idx = np.argmax(scores)
-            
-            if scores[top_idx] < CONF_THRESHOLD:
-                response = "I don't have enough information in my database to answer that specifically."
+    # 2. Source Selection (Threshold 0.45)
+    if top_score < 0.45:
+        with console.status("[bold magenta]Searching NIH MedlinePlus Online Database...[/bold magenta]"):
+            web_info = scrape_medical_info(user_input)
+            if web_info:
+                context = web_info
+                source = "Web Search (MedlinePlus)"
             else:
-                context = knowledge_base[top_idx]
-                prompt = (f"Context: {context}\n"
-                          f"Question: {question}\n"
-                          f"Answer the question using only the context provided in a full sentence:")
-                
-                inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
-                with torch.no_grad():
-                    output_ids = model.generate(**inputs, max_new_tokens=100)
-                response = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip().capitalize()
+                context = "No specific information found in the local database or MedlinePlus."
+                source = "No Data Found"
+    else:
+        context = knowledge_base[np.argmax(scores)]
+        source = "Local Knowledge Base"
 
-        # Use .after() to safely update UI from a different thread
-        self.after(0, lambda: self.append_chat("Bot", f"{response}{DISCLAIMER}"))
+    # 3. AI Answer Generation (Fixing the "Iii." issue)
+    # We provide a very structured prompt to avoid hallucinated garbage.
+    prompt = (
+        f"Background Medical Information: {context}\n\n"
+        f"User Question: {user_input}\n\n"
+        "Instructions: Based on the background info above, write a clear 1-2 sentence explanation. "
+        "If the background information is empty or irrelevant, say 'I do not have enough info.' "
+        "Do not provide single-word answers or gibberish."
+    )
+    
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, 
+            max_new_tokens=100, 
+            num_beams=2, 
+            early_stopping=True
+        )
+    ai_msg = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
-if __name__ == "__main__":
-    app = MedicalChatbotApp()
-    app.mainloop()
+    # Final formatting
+    formatted_res = f"AI: {ai_msg}\n[dim]Source: {source}[/dim]\n[dim]Note: {DISCLAIMER}[/dim]"
+    history.append((user_input, formatted_res))
